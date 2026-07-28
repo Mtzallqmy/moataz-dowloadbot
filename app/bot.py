@@ -2,132 +2,73 @@ import html
 import logging
 from pathlib import Path
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatAction
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
-
-from app.config import settings
 from app.downloader import DownloadRequest, cleanup_file, download_media, parse_time
 from app.state import runtime_state
+from app.telegram_api import TelegramClient
 
 logger = logging.getLogger(__name__)
-
-HELP_TEXT = (
-    "أرسل رابطًا من YouTube أو Facebook أو Instagram، ثم اختر الصيغة والجودة.\n\n"
-    "للتقطيع الحر أرسل الرابط بهذه الصيغة:\n"
-    "الرابط | البداية | النهاية\n"
-    "مثال: https://youtu.be/example | 00:30 | 01:10\n\n"
-    "يمكن استخدام عدد الثواني أو MM:SS أو HH:MM:SS. حمّل فقط المحتوى الذي تملك حق تنزيله."
-)
+HELP_TEXT = "أرسل رابطًا من YouTube أو Facebook أو Instagram، ثم اختر الصيغة والجودة.\n\nللتقطيع: الرابط | البداية | النهاية\nمثال: https://youtu.be/example | 00:30 | 01:10"
+USER_STATE: dict[int, dict[str, str]] = {}
 
 
-def main_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎬 تحميل فيديو", callback_data="mode:video"), InlineKeyboardButton("🎵 تحميل MP3", callback_data="mode:audio")],
-        [InlineKeyboardButton("✂️ شرح التقطيع", callback_data="help:cut"), InlineKeyboardButton("ℹ️ المساعدة", callback_data="help:main")],
-    ])
+def main_keyboard() -> dict:
+    return {"inline_keyboard": [[{"text": "🎬 تحميل فيديو", "callback_data": "mode:video"}, {"text": "🎵 تحميل MP3", "callback_data": "mode:audio"}], [{"text": "✂️ شرح التقطيع", "callback_data": "help:cut"}, {"text": "ℹ️ المساعدة", "callback_data": "help:main"}]]}
 
 
-def quality_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("360p", callback_data="quality:360"), InlineKeyboardButton("480p", callback_data="quality:480")],
-        [InlineKeyboardButton("720p", callback_data="quality:720"), InlineKeyboardButton("1080p", callback_data="quality:1080")],
-        [InlineKeyboardButton("أفضل جودة", callback_data="quality:best"), InlineKeyboardButton("↩️ رجوع", callback_data="home")],
-    ])
+def quality_keyboard() -> dict:
+    return {"inline_keyboard": [[{"text": "360p", "callback_data": "quality:360"}, {"text": "480p", "callback_data": "quality:480"}], [{"text": "720p", "callback_data": "quality:720"}, {"text": "1080p", "callback_data": "quality:1080"}], [{"text": "أفضل جودة", "callback_data": "quality:best"}, {"text": "↩️ رجوع", "callback_data": "home"}]]}
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.clear()
-    await update.effective_message.reply_text("مرحبًا بك في بوت معتز لتحميل وتقطيع المقاطع. اختر العملية:", reply_markup=main_keyboard())
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(HELP_TEXT, reply_markup=main_keyboard())
-
-
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-    data = query.data or ""
-    if data == "home":
-        context.user_data.clear()
-        await query.edit_message_text("اختر العملية:", reply_markup=main_keyboard())
-    elif data == "help:main":
-        await query.edit_message_text(HELP_TEXT, reply_markup=main_keyboard())
-    elif data == "help:cut":
-        await query.edit_message_text("أرسل: الرابط | البداية | النهاية\nمثال: الرابط | 00:30 | 01:10", reply_markup=main_keyboard())
-    elif data.startswith("mode:"):
-        mode = data.split(":", 1)[1]
-        context.user_data["mode"] = mode
-        if mode == "audio":
-            await query.edit_message_text("أرسل الرابط، أو الرابط | البداية | النهاية لتحميل MP3 مقصوص.")
-        else:
-            await query.edit_message_text("اختر جودة الفيديو:", reply_markup=quality_keyboard())
-    elif data.startswith("quality:"):
-        context.user_data["quality"] = data.split(":", 1)[1]
-        context.user_data.setdefault("mode", "video")
-        await query.edit_message_text("أرسل الرابط، أو الرابط | البداية | النهاية للتقطيع.")
-
-
-def parse_user_request(text: str, context: ContextTypes.DEFAULT_TYPE) -> DownloadRequest:
+def parse_user_request(text: str, state: dict[str, str] | None = None) -> DownloadRequest:
     parts = [part.strip() for part in text.split("|")]
     if len(parts) not in {1, 3}:
         raise ValueError("أرسل الرابط فقط، أو الرابط | البداية | النهاية.")
-    start = parse_time(parts[1]) if len(parts) == 3 else None
-    end = parse_time(parts[2]) if len(parts) == 3 else None
-    return DownloadRequest(
-        url=parts[0],
-        mode=context.user_data.get("mode", "video"),
-        quality=context.user_data.get("quality", "best"),
-        start=start,
-        end=end,
-    )
+    state = state or {}
+    return DownloadRequest(url=parts[0], mode=state.get("mode", "video"), quality=state.get("quality", "best"), start=parse_time(parts[1]) if len(parts) == 3 else None, end=parse_time(parts[2]) if len(parts) == 3 else None)
 
 
-async def send_result(update: Update, path: Path, mode: str) -> None:
-    await update.effective_chat.send_action(ChatAction.UPLOAD_DOCUMENT)
-    with path.open("rb") as media:
-        if mode == "audio" and path.suffix.lower() == ".mp3":
-            await update.effective_message.reply_audio(audio=media, caption="✅ تم التحميل بنجاح")
-        elif mode == "video" and path.suffix.lower() in {".mp4", ".mkv", ".webm"}:
-            await update.effective_message.reply_video(video=media, caption="✅ تم التحميل بنجاح", supports_streaming=True)
-        else:
-            await update.effective_message.reply_document(document=media, caption="✅ تم التحميل بنجاح")
-
-
-async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if not message or not message.text:
+async def handle_update(update: dict, client: TelegramClient) -> None:
+    if callback := update.get("callback_query"):
+        await client.answer_callback(callback["id"])
+        message = callback.get("message", {})
+        chat_id, message_id = message["chat"]["id"], message["message_id"]
+        state = USER_STATE.setdefault(chat_id, {})
+        data = callback.get("data", "")
+        if data == "home":
+            state.clear(); await client.edit_message(chat_id, message_id, "اختر العملية:", main_keyboard())
+        elif data == "help:main": await client.edit_message(chat_id, message_id, HELP_TEXT, main_keyboard())
+        elif data == "help:cut": await client.edit_message(chat_id, message_id, "أرسل: الرابط | البداية | النهاية\nمثال: الرابط | 00:30 | 01:10", main_keyboard())
+        elif data.startswith("mode:"):
+            state["mode"] = data.split(":", 1)[1]
+            await client.edit_message(chat_id, message_id, "أرسل الرابط، أو الرابط | البداية | النهاية." if state["mode"] == "audio" else "اختر جودة الفيديو:", None if state["mode"] == "audio" else quality_keyboard())
+        elif data.startswith("quality:"):
+            state["quality"] = data.split(":", 1)[1]; state.setdefault("mode", "video")
+            await client.edit_message(chat_id, message_id, "أرسل الرابط، أو الرابط | البداية | النهاية للتقطيع.")
         return
-    status = await message.reply_text("⏳ جارٍ فحص الرابط وتجهيز الملف...")
-    runtime_state.start_job()
-    path: Path | None = None
+
+    message = update.get("message") or {}
+    text = (message.get("text") or "").strip()
+    if not text:
+        return
+    chat_id = message["chat"]["id"]
+    if text.startswith("/start"):
+        USER_STATE.pop(chat_id, None); await client.send_message(chat_id, "مرحبًا بك في بوت معتز لتحميل وتقطيع المقاطع. اختر العملية:", main_keyboard()); return
+    if text.startswith("/help"):
+        await client.send_message(chat_id, HELP_TEXT, main_keyboard()); return
+    status = await client.send_message(chat_id, "⏳ جارٍ فحص الرابط وتجهيز الملف...")
+    status_id = status["message_id"]
+    runtime_state.start_job(); path: Path | None = None
     try:
-        request = parse_user_request(message.text, context)
+        request = parse_user_request(text, USER_STATE.get(chat_id))
         path = await download_media(request)
-        await status.edit_text("📤 اكتمل التجهيز، جارٍ الإرسال...")
-        await send_result(update, path, request.mode)
+        await client.edit_message(chat_id, status_id, "📤 اكتمل التجهيز، جارٍ الإرسال...")
+        await client.send_file(chat_id, path, request.mode)
         runtime_state.finish_job(True)
-        await status.delete()
+        await client.delete_message(chat_id, status_id)
     except Exception as exc:
-        logger.exception("Download job failed")
+        logger.exception("فشلت مهمة التنزيل")
         runtime_state.finish_job(False, str(exc))
-        safe_error = html.escape(str(exc))[:900]
-        await status.edit_text(f"❌ تعذر تنفيذ الطلب:\n{safe_error}\n\nجرّب رابطًا عامًا أو جودة أقل.")
+        await client.edit_message(chat_id, status_id, f"❌ تعذر تنفيذ الطلب:\n{html.escape(str(exc))[:900]}")
     finally:
         if path:
             cleanup_file(path)
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.exception("Unhandled Telegram error", exc_info=context.error)
-
-
-def build_application() -> Application:
-    app = Application.builder().token(settings.bot_token).updater(None).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(on_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
-    app.add_error_handler(error_handler)
-    return app
