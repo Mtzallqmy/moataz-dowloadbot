@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import unittest
@@ -9,10 +10,12 @@ os.environ.setdefault("BOT_TOKEN", "123456:test-token")
 os.environ.setdefault("PUBLIC_BASE_URL", "https://example.test/")
 os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
 os.environ.setdefault("ADMIN_PASSWORD", "test-password")
+os.environ.setdefault("MAX_FILE_MB", "500")
 
 from app.bot import parse_user_request
 from app.config import ConfigurationError, get_settings
-from app.downloader import cleanup_file, parse_time, validate_url
+from app.downloader import _format_for, cleanup_file, parse_time, validate_url
+from app.file_delivery import DeliveryRegistry
 from app.telegram_api import TelegramClient
 
 
@@ -38,6 +41,8 @@ class CoreTests(unittest.TestCase):
         settings = get_settings(Path("/definitely/missing/.env"))
         self.assertEqual(settings.public_base_url, "https://example.test")
         self.assertEqual(settings.webhook_url, "https://example.test/telegram/test-secret")
+        self.assertEqual(settings.max_file_mb, 500)
+        self.assertLessEqual(settings.telegram_upload_limit_mb, 49)
 
     def test_missing_required_variable_has_arabic_error(self):
         env = {"APP_MODE": "webhook", "BOT_TOKEN": "x", "PUBLIC_BASE_URL": "https://example.test", "WEBHOOK_SECRET": "secret"}
@@ -55,6 +60,12 @@ class CoreTests(unittest.TestCase):
         request = parse_user_request("https://youtu.be/test | 00:10 | 00:20", {"mode": "video", "quality": "720"})
         self.assertEqual((request.start, request.end, request.quality), (10, 20, "720"))
 
+    def test_light_audio_profile(self):
+        request = parse_user_request("https://youtu.be/test", {"mode": "audio", "audio_bitrate": "64"})
+        fmt, processors = _format_for(request)
+        self.assertIn("bestaudio", fmt)
+        self.assertEqual(processors[0]["preferredquality"], "64")
+
     def test_cleanup_file_removes_job_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp) / "job"
@@ -63,6 +74,21 @@ class CoreTests(unittest.TestCase):
             result.write_bytes(b"data")
             cleanup_file(result)
             self.assertFalse(job.exists())
+
+    def test_temporary_delivery_registry(self):
+        async def scenario():
+            with tempfile.TemporaryDirectory() as tmp:
+                job = Path(tmp) / "job"
+                job.mkdir()
+                result = job / "video.mp4"
+                result.write_bytes(b"data")
+                registry = DeliveryRegistry()
+                token = await registry.register(result, 300)
+                self.assertEqual(await registry.resolve(token), result)
+                await registry.consume(token)
+                self.assertIsNone(await registry.resolve(token))
+                self.assertFalse(job.exists())
+        asyncio.run(scenario())
 
     def test_secret_is_redacted(self):
         client = TelegramClient("very-secret-token")
