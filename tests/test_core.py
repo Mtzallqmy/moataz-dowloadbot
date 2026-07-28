@@ -5,9 +5,9 @@ os.environ.setdefault("PUBLIC_BASE_URL", "https://example.test")
 os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
 os.environ.setdefault("ADMIN_PASSWORD", "test-password")
 
-import pytest
+import pytest  # noqa: E402
 
-from app.downloader import parse_time, validate_url
+from app.downloader import parse_time, validate_url  # noqa: E402
 
 
 def test_parse_time_formats():
