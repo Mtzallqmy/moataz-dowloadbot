@@ -3,16 +3,23 @@ import hmac
 import json
 import logging
 import logging.handlers
+import mimetypes
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from app.bot import handle_update
 from app.config import settings
+from app.file_delivery import delivery_registry
 from app.state import runtime_state
 from app.telegram_api import TelegramClient
 
 LOG_FILE = settings.log_dir / "app.log"
 handler = logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s", handlers=[handler, logging.StreamHandler()])
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    handlers=[handler, logging.StreamHandler()],
+)
 logger = logging.getLogger(__name__)
 client = TelegramClient(settings.bot_token) if settings.bot_token else None
 
@@ -40,7 +47,7 @@ def _authorized(headers: dict[bytes, bytes]) -> bool:
 def _dashboard() -> str:
     stats = runtime_state.snapshot()
     last_error = (stats["last_error"] or "لا توجد أخطاء مسجلة").replace("<", "&lt;").replace(">", "&gt;")
-    return f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>لوحة بوت معتز</title><style>body{{font-family:system-ui;background:#0b1020;color:#eef2ff;margin:0;padding:24px}}.wrap{{max-width:980px;margin:auto}}header,.card{{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.13);border-radius:20px;padding:22px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin:18px 0}}.num{{font-size:34px;font-weight:800}}small{{color:#a5b4fc}}code{{color:#fca5a5}}</style></head><body><div class='wrap'><header><h1>لوحة إدارة بوت معتز</h1><p>حالة الخدمة: تعمل ✅ — الوضع: {settings.app_mode}</p></header><div class='grid'><div class='card'>إجمالي الطلبات<div class='num'>{stats['total_jobs']}</div></div><div class='card'>الناجحة<div class='num'>{stats['successful_jobs']}</div></div><div class='card'>الفاشلة<div class='num'>{stats['failed_jobs']}</div></div><div class='card'>النشطة<div class='num'>{stats['active_jobs']}</div></div></div><div class='card'><h3>آخر خطأ</h3><code>{last_error}</code><p><small>بدأت الخدمة: {stats['started_at']}</small></p></div></div></body></html>"""
+    return f"""<!doctype html><html lang='ar' dir='rtl'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>لوحة بوت معتز</title><style>body{{font-family:system-ui;background:#0b1020;color:#eef2ff;margin:0;padding:24px}}.wrap{{max-width:980px;margin:auto}}header,.card{{background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.13);border-radius:20px;padding:22px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin:18px 0}}.num{{font-size:34px;font-weight:800}}small{{color:#a5b4fc}}code{{color:#fca5a5}}</style></head><body><div class='wrap'><header><h1>لوحة إدارة بوت معتز</h1><p>حالة الخدمة: تعمل ✅ — الوضع: {settings.app_mode}</p><p>حد المعالجة: {settings.max_file_mb} MB — حد إرسال Telegram المباشر: {settings.telegram_upload_limit_mb} MB</p></header><div class='grid'><div class='card'>إجمالي الطلبات<div class='num'>{stats['total_jobs']}</div></div><div class='card'>الناجحة<div class='num'>{stats['successful_jobs']}</div></div><div class='card'>الفاشلة<div class='num'>{stats['failed_jobs']}</div></div><div class='card'>النشطة<div class='num'>{stats['active_jobs']}</div></div></div><div class='card'><h3>آخر خطأ</h3><code>{last_error}</code><p><small>بدأت الخدمة: {stats['started_at']}</small></p></div></div></body></html>"""
 
 
 async def _receive_body(receive) -> bytes:
@@ -50,6 +57,23 @@ async def _receive_body(receive) -> bytes:
         chunks.append(message.get("body", b""))
         if not message.get("more_body"):
             return b"".join(chunks)
+
+
+async def _stream_file(send, path) -> None:
+    content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    filename = quote(path.name)
+    headers = [
+        (b"content-type", content_type.encode("latin1")),
+        (b"content-length", str(path.stat().st_size).encode()),
+        (b"content-disposition", f"attachment; filename*=UTF-8''{filename}".encode("latin1")),
+        (b"cache-control", b"private, no-store"),
+        (b"x-content-type-options", b"nosniff"),
+    ]
+    await send({"type": "http.response.start", "status": 200, "headers": headers})
+    with path.open("rb") as media:
+        while chunk := media.read(1024 * 1024):
+            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+    await send({"type": "http.response.body", "body": b"", "more_body": False})
 
 
 async def app(scope, receive, send):
@@ -74,13 +98,46 @@ async def app(scope, receive, send):
                 return
     if scope["type"] != "http":
         return
+
     method, path = scope["method"], scope["path"]
     headers = {k.lower(): v for k, v in scope.get("headers", [])}
+
+    if method == "GET" and path.startswith("/download/"):
+        token = path.removeprefix("/download/")
+        file_path = await delivery_registry.resolve(token)
+        if not file_path:
+            status, response_headers, body = _json(404, {"error": "رابط التنزيل غير صالح أو انتهت صلاحيته"})
+            await send({"type": "http.response.start", "status": status, "headers": response_headers})
+            await send({"type": "http.response.body", "body": body})
+            return
+        try:
+            await _stream_file(send, file_path)
+        except (BrokenPipeError, ConnectionResetError):
+            logger.info("انقطع اتصال تنزيل الملف قبل اكتماله")
+        return
+
     status, response_headers, body = _json(404, {"error": "المسار غير موجود"})
     if method == "GET" and path == "/":
-        status, response_headers, body = _json(200, {"service": "moataz-download-bot", "status": "running", "mode": settings.app_mode, "dashboard": "/dashboard"})
+        status, response_headers, body = _json(
+            200,
+            {
+                "service": "moataz-download-bot",
+                "status": "running",
+                "mode": settings.app_mode,
+                "max_file_mb": settings.max_file_mb,
+                "dashboard": "/dashboard",
+            },
+        )
     elif method == "GET" and path == "/health":
-        status, response_headers, body = _json(200, {"status": "ok", "mode": settings.app_mode, "time": datetime.now(timezone.utc).isoformat(), "stats": runtime_state.snapshot()})
+        status, response_headers, body = _json(
+            200,
+            {
+                "status": "ok",
+                "mode": settings.app_mode,
+                "time": datetime.now(timezone.utc).isoformat(),
+                "stats": runtime_state.snapshot(),
+            },
+        )
     elif method == "GET" and path == "/dashboard":
         if _authorized(headers):
             status, response_headers, body = _html(200, _dashboard())
