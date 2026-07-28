@@ -61,7 +61,11 @@ class Settings:
     download_dir: Path
     log_dir: Path
     max_file_mb: int
+    telegram_upload_limit_mb: int
+    download_link_ttl_seconds: int
     max_duration_seconds: int
+    concurrent_fragments: int
+    cookies_file: Path | None
     domains: frozenset[str]
     port: int
     app_mode: str
@@ -111,6 +115,14 @@ def get_settings(env_file: Path | None = None) -> Settings:
     download_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
+    cookies_raw = os.getenv("COOKIES_FILE", "").strip()
+    cookies_file = Path(cookies_raw).expanduser() if cookies_raw else None
+    if cookies_file and not cookies_file.is_absolute():
+        cookies_file = (ROOT_DIR / cookies_file).resolve()
+
+    max_file_mb = _positive_int("MAX_FILE_MB", 500, 1, 500)
+    telegram_limit = _positive_int("TELEGRAM_UPLOAD_LIMIT_MB", 49, 1, 49)
+
     return Settings(
         bot_token=bot_token,
         public_base_url=public_base_url,
@@ -119,8 +131,12 @@ def get_settings(env_file: Path | None = None) -> Settings:
         admin_password=admin_password,
         download_dir=download_dir,
         log_dir=log_dir,
-        max_file_mb=_positive_int("MAX_FILE_MB", 45),
+        max_file_mb=max_file_mb,
+        telegram_upload_limit_mb=min(telegram_limit, max_file_mb),
+        download_link_ttl_seconds=_positive_int("DOWNLOAD_LINK_TTL_SECONDS", 3600, 300, 86400),
         max_duration_seconds=_positive_int("MAX_DURATION_SECONDS", 7200),
+        concurrent_fragments=_positive_int("CONCURRENT_FRAGMENTS", 4, 1, 8),
+        cookies_file=cookies_file,
         domains=domains,
         port=_positive_int("PORT", 8000, 1, 65535),
         app_mode=app_mode,
