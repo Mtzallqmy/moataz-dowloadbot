@@ -16,19 +16,19 @@
 
 - Webhook محمي بـ `WEBHOOK_SECRET` وترويسة Telegram السرية.
 - تنزيل فيديو بجودات 360p و480p و720p و1080p وأفضل جودة.
-- استخراج MP3.
+- صوت MP3 بخيارات 64k و96k و128k و192k.
 - تقطيع حر: `الرابط | البداية | النهاية`.
 - قبول الثواني أو `MM:SS` أو `HH:MM:SS`.
-- أزرار Telegram Inline.
-- حد للحجم والمدة والنطاقات.
-- تنظيف الملفات المؤقتة عند النجاح أو الفشل.
+- حد معالجة يصل إلى 500 MB.
+- رفع الملفات الصغيرة مباشرة إلى Telegram بطريقة متدفقة دون تحميل الملف كاملًا في الذاكرة.
+- تسليم الملفات الأكبر من حد Telegram عبر رابط HTTPS مؤقت وآمن من خلال Cloudflare Tunnel.
+- تنزيل أجزاء الفيديو المتعددة بالتوازي عبر `CONCURRENT_FRAGMENTS`.
+- دعم ملف Cookies اختياري للمقاطع المقيدة أو التي تعيد HTTP 403.
+- تنظيف الملفات المؤقتة بعد الرفع أو عند انتهاء رابط التنزيل.
 - لوحة إدارة محمية بـ HTTP Basic Auth على `/dashboard`.
 - فحص صحة على `/health` وإحصاءات تشغيل.
-- وضع محلي للاختبار دون تسجيل Webhook.
 
 ## التثبيت على Termux
-
-استخدم نسخة Termux الرسمية الحديثة، ثم نفّذ:
 
 ```bash
 pkg update -y
@@ -42,8 +42,6 @@ python scripts/check-termux.py
 bash scripts/start-termux.sh
 ```
 
-سكربت التجهيز يثبت فقط `python` و`git` و`ffmpeg` و`openssl`، وينشئ `.venv` ومجلدي `downloads` و`logs`، ولا يثبت Rust أو clang أو make ولا يرقّي pip أو setuptools أو wheel.
-
 ## إعداد `.env`
 
 ```env
@@ -54,17 +52,28 @@ WEBHOOK_SECRET=
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=
 DOWNLOAD_DIR=./downloads
-MAX_FILE_MB=45
+MAX_FILE_MB=500
+TELEGRAM_UPLOAD_LIMIT_MB=49
+DOWNLOAD_LINK_TTL_SECONDS=3600
 MAX_DURATION_SECONDS=7200
+CONCURRENT_FRAGMENTS=4
+COOKIES_FILE=
 ALLOWED_DOMAINS=youtube.com,youtu.be,facebook.com,fb.watch,instagram.com
 PORT=8000
 ```
 
-في وضع `webhook` يجب أن يبدأ `PUBLIC_BASE_URL` بـ `https://`، ولا يقبل `localhost`. تُحذف الشرطة المائلة النهائية تلقائيًا.
+### إعدادات الحجم والسرعة
+
+- `MAX_FILE_MB=500`: أقصى حجم يسمح للبوت بتنزيله ومعالجته.
+- `TELEGRAM_UPLOAD_LIMIT_MB=49`: الملفات الأصغر تُرفع مباشرة إلى Telegram. لا ترفع القيمة فوق 49 مع Bot API السحابي.
+- الملفات الأكبر تُسلّم عبر رابط مؤقت من نفس `PUBLIC_BASE_URL`.
+- `DOWNLOAD_LINK_TTL_SECONDS=3600`: صلاحية رابط الملف الكبير بالثواني.
+- `CONCURRENT_FRAGMENTS=4`: تنزيل متوازٍ لأجزاء HLS/DASH. يمكن رفعه حتى 8 إذا كان الهاتف والاتصال مستقرين.
+- الصوت الافتراضي الخفيف هو 96k، ويمكن اختيار 64k أو 128k أو 192k من أزرار البوت.
 
 ## Cloudflare Tunnel
 
-بعد تشغيل الخادم، افتح جلسة Termux ثانية:
+افتح جلسة Termux ثانية:
 
 ```bash
 pkg install cloudflared -y
@@ -77,17 +86,39 @@ cloudflared tunnel --url http://127.0.0.1:8000
 PUBLIC_BASE_URL=https://your-tunnel.trycloudflare.com
 ```
 
-ثم أوقف الخادم بـ `Ctrl+C` وأعد تشغيله:
+ثم أعد تشغيل الخادم:
 
 ```bash
 bash scripts/start-termux.sh
 ```
 
-عند بدء التطبيق يحذف Webhook القديم ثم يسجل الرابط الجديد مع إعادة محاولة محدودة، دون طباعة التوكن في السجلات.
+يجب إبقاء جلسة Uvicorn وجلسة Cloudflare Tunnel تعملان أثناء تنزيل الملفات الكبيرة من الرابط المؤقت.
+
+## معالجة HTTP 403 من YouTube
+
+ابدأ دائمًا بتحديث yt-dlp داخل البيئة الافتراضية:
+
+```bash
+.venv/bin/python -m pip install -U yt-dlp
+```
+
+المشروع يستخدم عدة عملاء YouTube وUser-Agent مناسبًا ويدعم استكمال التنزيل وإعادة المحاولة. بعض المقاطع المقيدة أو التي تطلب تسجيل الدخول تحتاج ملف Cookies.
+
+أنشئ ملف Cookies بصيغة Netscape من متصفح موثوق، ثم ضعه داخل المشروع مثلًا:
+
+```text
+cookies.txt
+```
+
+وأضف إلى `.env`:
+
+```env
+COOKIES_FILE=./cookies.txt
+```
+
+لا ترفع ملف Cookies إلى GitHub ولا تشاركه مع أي شخص. استخدام Cookies الحساب قد يعرّض الحساب لتقييد مؤقت، لذلك استخدمها فقط عند الضرورة.
 
 ## الوضع المحلي
-
-للتجربة دون Telegram Webhook:
 
 ```env
 APP_MODE=local
@@ -101,29 +132,20 @@ PORT=8000
 bash scripts/start-termux.sh
 ```
 
-المسارات المتاحة:
+المسارات:
 
 - `http://127.0.0.1:8000/`
 - `http://127.0.0.1:8000/health`
 - `http://127.0.0.1:8000/dashboard`
 
-## الفحص
+## الفحص والاختبارات
 
 ```bash
 python scripts/check-termux.py
-```
-
-يفحص المعمارية، Python، FFmpeg، yt-dlp، الاستيرادات، المجلدات، الإعدادات، المنفذ، Telegram API، وعدم وجود الاعتماديات المحظورة في `requirements.txt`.
-
-## الاختبارات دون شبكة
-
-```bash
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
 ## التشغيل المباشر
-
-الأمر الذي يستخدمه سكربت التشغيل:
 
 ```bash
 python -m uvicorn app.main:app --host 0.0.0.0 --port "$PORT"
@@ -133,10 +155,11 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port "$PORT"
 
 ## السجلات
 
-تُكتب السجلات المنظمة في `logs/app.log` مع تدوير تلقائي، وتُخفى التوكنات من أخطاء Telegram. لا ترفع `.env` أو ملفات التنزيل إلى GitHub.
+تُكتب السجلات في `logs/app.log` مع تدوير تلقائي. لا تُطبع التوكنات، ولا يجب رفع `.env` أو Cookies أو ملفات التنزيل إلى GitHub.
 
 ## قيود معروفة
 
-- روابط Facebook وInstagram الخاصة أو المقيدة قد تحتاج Cookies، وهي غير مفعلة افتراضيًا لحماية الحسابات.
-- حجم رفع Telegram للبوت يظل خاضعًا لحدود Telegram والخادم المستخدم.
+- Telegram Bot API السحابي لا يقبل رفع ملفات bot multipart أكبر من 50 MB، لذلك يستخدم المشروع روابط HTTPS مؤقتة للملفات الأكبر.
 - Cloudflare Quick Tunnel رابط مؤقت يتغير عند إعادة تشغيله؛ للإنتاج استخدم Tunnel ثابتًا أو نطاقًا دائمًا.
+- روابط Facebook وInstagram الخاصة والمقاطع المحمية قد تحتاج Cookies صالحة.
+- بعض تغييرات YouTube قد تتطلب تحديث `yt-dlp` باستمرار.
