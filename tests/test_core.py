@@ -1,3 +1,10 @@
+import os
+
+os.environ.setdefault("BOT_TOKEN", "123456:test-token")
+os.environ.setdefault("PUBLIC_BASE_URL", "https://example.test")
+os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+os.environ.setdefault("ADMIN_PASSWORD", "test-password")
+
 import pytest
 
 from app.downloader import parse_time, validate_url
