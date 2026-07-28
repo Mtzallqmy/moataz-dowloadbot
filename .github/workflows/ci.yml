@@ -2,25 +2,34 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, termux-compat]
   pull_request:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.12', '3.14']
+    env:
+      APP_MODE: local
+      ADMIN_PASSWORD: ci-test-password
+      PORT: '8765'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install FFmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        run: python -m pip install -r requirements.txt
       - name: Compile
-        run: python -m compileall -q app
-      - name: Lint
-        run: ruff check app tests
-      - name: Test
-        run: pytest -q
+        run: python -m compileall -q app scripts tests
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Internal compatibility check
+        run: python scripts/check-termux.py --setup
+      - name: Forbidden dependency check
+        run: "! grep -Eiq '(pydantic|pydantic-core|watchfiles|uvloop|httptools|maturin|uvicorn\\[standard\\])' requirements*.txt"
