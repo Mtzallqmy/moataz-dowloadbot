@@ -12,9 +12,9 @@ os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
 os.environ.setdefault("ADMIN_PASSWORD", "test-password")
 os.environ.setdefault("MAX_FILE_MB", "500")
 
-from app.bot import parse_user_request
+from app.bot import _format_keyboard, parse_user_request
 from app.config import ConfigurationError, get_settings
-from app.downloader import _format_for, cleanup_file, parse_time, validate_url
+from app.downloader import _build_audio_options, _build_video_options, cleanup_file, parse_time, validate_url
 from app.file_delivery import DeliveryRegistry
 from app.telegram_api import TelegramClient
 
@@ -57,14 +57,33 @@ class CoreTests(unittest.TestCase):
                 get_settings(Path("/definitely/missing/.env"))
 
     def test_request_parsing(self):
-        request = parse_user_request("https://youtu.be/test | 00:10 | 00:20", {"mode": "video", "quality": "720"})
-        self.assertEqual((request.start, request.end, request.quality), (10, 20, "720"))
+        request = parse_user_request("https://youtu.be/test | 00:10 | 00:20", {"mode": "video"})
+        self.assertEqual((request.start, request.end, request.mode), (10, 20, "video"))
 
-    def test_light_audio_profile(self):
-        request = parse_user_request("https://youtu.be/test", {"mode": "audio", "audio_bitrate": "64"})
-        fmt, processors = _format_for(request)
-        self.assertIn("bestaudio", fmt)
-        self.assertEqual(processors[0]["preferredquality"], "64")
+    def test_dynamic_audio_profiles_include_light_and_heavy(self):
+        formats = [{"format_id": "a1", "ext": "m4a", "vcodec": "none", "acodec": "mp4a", "abr": 128, "filesize": 1_000_000}]
+        options = _build_audio_options(formats, 120)
+        labels = " ".join(option.label for option in options)
+        self.assertIn("MP3 48k", labels)
+        self.assertIn("MP3 320k", labels)
+        self.assertIn("M4A", labels)
+
+    def test_dynamic_video_profiles_include_direct_and_merged(self):
+        formats = [
+            {"format_id": "v1", "ext": "mp4", "vcodec": "avc1", "acodec": "mp4a", "height": 360, "filesize": 2_000_000},
+            {"format_id": "v2", "ext": "mp4", "vcodec": "avc1", "acodec": "none", "height": 720, "filesize": 5_000_000},
+        ]
+        options = _build_video_options(formats, 120)
+        labels = " ".join(option.label for option in options)
+        self.assertIn("360p", labels)
+        self.assertIn("720p", labels)
+        self.assertIn("أفضل جودة", labels)
+
+    def test_format_keyboard_callback_data_is_small(self):
+        options = tuple(_build_audio_options([], 60))
+        keyboard = _format_keyboard(options)
+        callbacks = [button["callback_data"] for row in keyboard["inline_keyboard"] for button in row]
+        self.assertTrue(all(len(value.encode()) <= 64 for value in callbacks))
 
     def test_cleanup_file_removes_job_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
