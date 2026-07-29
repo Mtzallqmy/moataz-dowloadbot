@@ -15,6 +15,7 @@ from app.config import settings
 logger = logging.getLogger(__name__)
 TIME_RE = re.compile(r"^(?:(\d+):)?([0-5]?\d):([0-5]?\d)$|^(\d+)$")
 MEDIA_SUFFIXES = {".mp4", ".mkv", ".webm", ".mp3", ".m4a", ".ogg", ".opus", ".aac"}
+AUDIO_BITRATES = (48, 64, 96, 128, 160, 192, 256, 320)
 
 
 @dataclass(slots=True)
@@ -23,8 +24,29 @@ class DownloadRequest:
     mode: str = "video"
     quality: str = "best"
     audio_bitrate: str = "96"
+    audio_codec: str = "mp3"
+    format_selector: str | None = None
+    output_ext: str | None = None
     start: int | None = None
     end: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MediaOption:
+    key: str
+    label: str
+    mode: str
+    selector: str
+    output_ext: str
+    audio_codec: str = ""
+    audio_bitrate: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class MediaInfo:
+    title: str
+    duration: int | None
+    options: tuple[MediaOption, ...]
 
 
 def parse_time(value: str | None) -> int | None:
@@ -48,74 +70,17 @@ def validate_url(url: str) -> None:
         raise ValueError("هذا النطاق غير مدعوم حاليًا.")
 
 
-def _format_for(req: DownloadRequest) -> tuple[str, list[dict]]:
-    if req.mode == "audio":
-        bitrate = req.audio_bitrate if req.audio_bitrate in {"64", "96", "128", "192"} else "96"
-        return "bestaudio[ext=m4a]/bestaudio/best", [
-            {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": bitrate},
-            {"key": "FFmpegMetadata", "add_metadata": True},
-        ]
-
-    formats = {
-        "360": "best[ext=mp4][height<=360]/best[height<=360]/bestvideo[height<=360]+bestaudio/best",
-        "480": "best[ext=mp4][height<=480]/best[height<=480]/bestvideo[height<=480]+bestaudio/best",
-        "720": "best[ext=mp4][height<=720]/best[height<=720]/bestvideo[height<=720]+bestaudio/best",
-        "1080": "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4][height<=1080]/best",
-        "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best",
-    }
-    return formats.get(req.quality, formats["best"]), []
-
-
-def _candidate_files(job_dir: Path) -> list[Path]:
-    return [
-        path
-        for path in job_dir.rglob("*")
-        if path.is_file()
-        and path.suffix.lower() in MEDIA_SUFFIXES
-        and not path.name.endswith((".part", ".ytdl", ".temp"))
-        and path.stat().st_size > 0
-    ]
-
-
-def _friendly_download_error(exc: Exception) -> RuntimeError:
-    text = str(exc)
-    lowered = text.lower()
-    if "403" in lowered or "forbidden" in lowered:
-        return RuntimeError(
-            "رفضت المنصة طلب التحميل مؤقتًا (HTTP 403). حدّث yt-dlp، ثم جرّب مجددًا. "
-            "للمقاطع المقيدة أضف ملف Cookies صالحًا عبر COOKIES_FILE."
-        )
-    if "sign in" in lowered or "cookies" in lowered or "age" in lowered:
-        return RuntimeError("المقطع يحتاج تسجيل دخول أو Cookies. حدّد COOKIES_FILE في ملف .env.")
-    if "requested format is not available" in lowered:
-        return RuntimeError("الجودة المطلوبة غير متاحة لهذا المقطع. جرّب جودة أقل أو أفضل جودة.")
-    return RuntimeError(f"فشل yt-dlp في تحميل المقطع: {text[-500:]}")
-
-
-def _download_sync(req: DownloadRequest) -> Path:
-    validate_url(req.url)
-    job_dir = settings.download_dir / uuid.uuid4().hex
-    job_dir.mkdir(parents=True, exist_ok=True)
-    outtmpl = str(job_dir / "%(title).120B-%(id)s.%(ext)s")
-    fmt, postprocessors = _format_for(req)
-
-    opts = {
-        "format": fmt,
-        "outtmpl": outtmpl,
-        "merge_output_format": "mp4",
+def _base_options() -> dict:
+    options = {
         "noplaylist": True,
-        "restrictfilenames": True,
         "quiet": True,
         "no_warnings": True,
-        "postprocessors": postprocessors,
-        "max_filesize": settings.max_file_mb * 1024 * 1024,
-        "socket_timeout": 30,
+        "socket_timeout": 25,
         "retries": 5,
         "fragment_retries": 10,
         "file_access_retries": 3,
         "concurrent_fragment_downloads": settings.concurrent_fragments,
         "continuedl": True,
-        "overwrites": False,
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/124 Safari/537.36",
             "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
@@ -124,36 +89,213 @@ def _download_sync(req: DownloadRequest) -> Path:
     }
     if settings.cookies_file:
         if not settings.cookies_file.is_file():
-            shutil.rmtree(job_dir, ignore_errors=True)
             raise ValueError(f"ملف Cookies غير موجود: {settings.cookies_file}")
-        opts["cookiefile"] = str(settings.cookies_file)
+        options["cookiefile"] = str(settings.cookies_file)
+    return options
 
+
+def _size_text(size: int | float | None) -> str:
+    if not size:
+        return "حجم غير معروف"
+    mb = float(size) / (1024 * 1024)
+    return f"{mb:.1f}MB" if mb < 100 else f"{mb:.0f}MB"
+
+
+def _estimate_size(fmt: dict, duration: int | None) -> int | None:
+    value = fmt.get("filesize") or fmt.get("filesize_approx")
+    if value:
+        return int(value)
+    tbr = fmt.get("tbr")
+    if tbr and duration:
+        return int(float(tbr) * 1000 / 8 * duration)
+    return None
+
+
+def _build_video_options(formats: list[dict], duration: int | None) -> list[MediaOption]:
+    progressive: dict[tuple[int, str], tuple[dict, int | None]] = {}
+    heights: set[int] = set()
+    for fmt in formats:
+        if fmt.get("vcodec") in {None, "none"}:
+            continue
+        height = int(fmt.get("height") or 0)
+        if not height:
+            continue
+        heights.add(height)
+        ext = str(fmt.get("ext") or "mp4").lower()
+        if fmt.get("acodec") not in {None, "none"}:
+            size = _estimate_size(fmt, duration)
+            key = (height, ext)
+            current = progressive.get(key)
+            if current is None or (size or 10**18) < (current[1] or 10**18):
+                progressive[key] = (fmt, size)
+
+    options: list[MediaOption] = []
+    for (height, ext), (fmt, size) in sorted(progressive.items(), key=lambda item: (item[0][0], item[0][1])):
+        if ext not in {"mp4", "webm"}:
+            continue
+        fid = str(fmt.get("format_id"))
+        options.append(MediaOption(
+            key=f"vd{len(options)}",
+            label=f"⚡ {height}p {ext.upper()} مباشر • {_size_text(size)}",
+            mode="video",
+            selector=fid,
+            output_ext=ext,
+        ))
+
+    common_heights = sorted({h for h in heights if h in {144, 240, 360, 480, 720, 1080, 1440, 2160}})
+    if not common_heights:
+        common_heights = sorted(heights)[-8:]
+    for height in common_heights:
+        selector = (
+            f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={height}]+bestaudio/best[height<={height}]"
+        )
+        options.append(MediaOption(
+            key=f"vm{len(options)}",
+            label=f"🎬 {height}p MP4 مدمج • جودة كاملة",
+            mode="video",
+            selector=selector,
+            output_ext="mp4",
+        ))
+    options.append(MediaOption(
+        key="vbest",
+        label="🏆 أفضل جودة متاحة • ثقيل",
+        mode="video",
+        selector="bestvideo+bestaudio/best",
+        output_ext="mp4",
+    ))
+    return options[:30]
+
+
+def _build_audio_options(formats: list[dict], duration: int | None) -> list[MediaOption]:
+    options: list[MediaOption] = []
+    for bitrate in AUDIO_BITRATES:
+        options.append(MediaOption(
+            key=f"mp3{bitrate}",
+            label=f"🎵 MP3 {bitrate}k" + (" • صغير جدًا" if bitrate <= 64 else " • خفيف" if bitrate <= 96 else " • متوازن" if bitrate <= 160 else " • عالي"),
+            mode="audio",
+            selector="bestaudio[ext=m4a]/bestaudio/best",
+            output_ext="mp3",
+            audio_codec="mp3",
+            audio_bitrate=str(bitrate),
+        ))
+
+    source_by_ext: dict[str, tuple[dict, int | None]] = {}
+    for fmt in formats:
+        if fmt.get("vcodec") not in {None, "none"} or fmt.get("acodec") in {None, "none"}:
+            continue
+        ext = str(fmt.get("ext") or "").lower()
+        if ext not in {"m4a", "opus", "webm", "aac"}:
+            continue
+        size = _estimate_size(fmt, duration)
+        current = source_by_ext.get(ext)
+        abr = float(fmt.get("abr") or fmt.get("tbr") or 0)
+        if current is None or abr > float(current[0].get("abr") or current[0].get("tbr") or 0):
+            source_by_ext[ext] = (fmt, size)
+    for ext, (fmt, size) in source_by_ext.items():
+        label_ext = "OPUS" if ext in {"opus", "webm"} else ext.upper()
+        options.append(MediaOption(
+            key=f"as{len(options)}",
+            label=f"⚡ {label_ext} أصلي بلا تحويل • {_size_text(size)}",
+            mode="audio",
+            selector=str(fmt.get("format_id")),
+            output_ext="opus" if ext == "webm" else ext,
+        ))
+    return options[:20]
+
+
+def _friendly_download_error(exc: Exception) -> RuntimeError:
+    text = str(exc)
+    lowered = text.lower()
+    if "429" in lowered or "too many requests" in lowered:
+        return RuntimeError("المنصة قيّدت الطلبات مؤقتًا (HTTP 429). انتظر قليلًا ثم حاول مجددًا.")
+    if "403" in lowered or "forbidden" in lowered:
+        return RuntimeError("رفضت المنصة التحميل (HTTP 403). حدّث yt-dlp، وجرّب Cookies صالحة عبر COOKIES_FILE للمقاطع المقيدة.")
+    if "sign in" in lowered or "cookies" in lowered or "age" in lowered:
+        return RuntimeError("المقطع يحتاج تسجيل دخول أو Cookies. حدّد COOKIES_FILE في ملف .env.")
+    if "private video" in lowered:
+        return RuntimeError("هذا المقطع خاص ولا يمكن تحميله دون حساب مخوّل.")
+    if "requested format is not available" in lowered:
+        return RuntimeError("الصيغة المختارة لم تعد متاحة. أرسل الرابط مجددًا لتحديث قائمة الصيغ.")
+    if "unsupported url" in lowered:
+        return RuntimeError("الرابط غير مدعوم أو غير مكتمل.")
+    return RuntimeError(f"فشل yt-dlp: {text[-450:]}")
+
+
+def _inspect_sync(url: str, mode: str) -> MediaInfo:
+    validate_url(url)
+    opts = _base_options()
+    opts["skip_download"] = True
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except DownloadError as exc:
+        raise _friendly_download_error(exc) from exc
+    if not isinstance(info, dict):
+        raise RuntimeError("تعذر قراءة معلومات المقطع.")
+    if info.get("entries"):
+        info = next((entry for entry in info["entries"] if entry), info)
+    title = str(info.get("title") or "مقطع بلا عنوان")[:180]
+    duration = int(info.get("duration")) if info.get("duration") else None
+    formats = list(info.get("formats") or [])
+    options = _build_audio_options(formats, duration) if mode == "audio" else _build_video_options(formats, duration)
+    if not options:
+        raise RuntimeError("لم تعثر المنصة على صيغ قابلة للتنزيل لهذا الرابط.")
+    return MediaInfo(title=title, duration=duration, options=tuple(options))
+
+
+async def inspect_media(url: str, mode: str) -> MediaInfo:
+    return await asyncio.to_thread(_inspect_sync, url, mode)
+
+
+def _candidate_files(job_dir: Path) -> list[Path]:
+    return [p for p in job_dir.rglob("*") if p.is_file() and p.suffix.lower() in MEDIA_SUFFIXES and not p.name.endswith((".part", ".ytdl", ".temp")) and p.stat().st_size > 0]
+
+
+def _download_sync(req: DownloadRequest) -> Path:
+    validate_url(req.url)
+    job_dir = settings.download_dir / uuid.uuid4().hex
+    job_dir.mkdir(parents=True, exist_ok=True)
+    selector = req.format_selector or ("bestaudio/best" if req.mode == "audio" else "bestvideo+bestaudio/best")
+    postprocessors: list[dict] = []
+    if req.mode == "audio" and req.audio_codec == "mp3":
+        bitrate = req.audio_bitrate if req.audio_bitrate in {str(v) for v in AUDIO_BITRATES} else "96"
+        postprocessors = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": bitrate}, {"key": "FFmpegMetadata", "add_metadata": True}]
+
+    opts = _base_options()
+    opts.update({
+        "format": selector,
+        "outtmpl": str(job_dir / "%(title).120B-%(id)s.%(ext)s"),
+        "merge_output_format": req.output_ext if req.output_ext in {"mp4", "mkv", "webm"} else "mp4",
+        "restrictfilenames": True,
+        "postprocessors": postprocessors,
+        "max_filesize": settings.max_file_mb * 1024 * 1024,
+        "overwrites": False,
+    })
     if req.start is not None or req.end is not None:
         start = req.start or 0
-        end = req.end
-        if end is not None and end <= start:
+        if req.end is not None and req.end <= start:
             raise ValueError("وقت النهاية يجب أن يكون بعد وقت البداية.")
-        if end is not None and end - start > settings.max_duration_seconds:
+        if req.end is not None and req.end - start > settings.max_duration_seconds:
             raise ValueError("مدة المقطع المطلوبة تتجاوز الحد المسموح.")
-        opts["download_sections"] = f"*{start}-{'' if end is None else end}"
+        opts["download_sections"] = f"*{start}-{'' if req.end is None else req.end}"
         opts["force_keyframes_at_cuts"] = False
 
-    logger.info("بدء مهمة تنزيل: mode=%s quality=%s", req.mode, req.quality)
+    logger.info("بدء تنزيل: mode=%s selector=%s", req.mode, selector[:100])
     try:
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(req.url, download=True)
             duration = info.get("duration") if isinstance(info, dict) else None
             if duration and duration > settings.max_duration_seconds and req.start is None and req.end is None:
                 raise ValueError("مدة الفيديو تتجاوز الحد المسموح.")
-
         files = _candidate_files(job_dir)
         if not files:
-            raise RuntimeError("اكتمل yt-dlp دون إنشاء ملف وسائط صالح. حدّث yt-dlp أو جرّب جودة أخرى.")
+            raise RuntimeError("اكتمل yt-dlp دون إنشاء ملف صالح. أرسل الرابط مجددًا واختر صيغة أخرى.")
         result = max(files, key=lambda p: (p.stat().st_size, p.stat().st_mtime))
         size_mb = result.stat().st_size / (1024 * 1024)
         if size_mb > settings.max_file_mb:
             raise ValueError(f"حجم الملف {size_mb:.1f} MB ويتجاوز الحد {settings.max_file_mb} MB.")
-        logger.info("انتهت مهمة التنزيل بنجاح: size_mb=%.2f suffix=%s", size_mb, result.suffix)
+        logger.info("اكتمل التنزيل: size_mb=%.2f ext=%s", size_mb, result.suffix)
         return result
     except DownloadError as exc:
         shutil.rmtree(job_dir, ignore_errors=True)
