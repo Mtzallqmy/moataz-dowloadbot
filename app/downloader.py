@@ -75,17 +75,20 @@ def _base_options() -> dict:
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "socket_timeout": 25,
+        "socket_timeout": 30,
         "retries": 5,
         "fragment_retries": 10,
         "file_access_retries": 3,
         "concurrent_fragment_downloads": settings.concurrent_fragments,
         "continuedl": True,
+        "js_runtimes": {"deno": {}},
         "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Linux; Android 13; Mobile) AppleWebKit/537.36 Chrome/124 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
             "Accept-Language": "ar,en-US;q=0.9,en;q=0.8",
         },
-        "extractor_args": {"youtube": {"player_client": ["android_vr", "web_safari", "web"]}},
+        "extractor_args": {
+            "youtube": {"player_client": ["web", "web_safari", "android_vr"]},
+        },
     }
     if settings.cookies_file:
         if not settings.cookies_file.is_file():
@@ -204,22 +207,52 @@ def _build_audio_options(formats: list[dict], duration: int | None) -> list[Medi
     return options[:20]
 
 
+def _contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    return any(marker in text for marker in markers)
+
+
 def _friendly_download_error(exc: Exception) -> RuntimeError:
-    text = str(exc)
+    text = re.sub(r"\s+", " ", str(exc)).strip()
     lowered = text.lower()
-    if "429" in lowered or "too many requests" in lowered:
-        return RuntimeError("المنصة قيّدت الطلبات مؤقتًا (HTTP 429). انتظر قليلًا ثم حاول مجددًا.")
-    if "403" in lowered or "forbidden" in lowered:
-        return RuntimeError("رفضت المنصة التحميل (HTTP 403). حدّث yt-dlp، وجرّب Cookies صالحة عبر COOKIES_FILE للمقاطع المقيدة.")
-    if "sign in" in lowered or "cookies" in lowered or "age" in lowered:
-        return RuntimeError("المقطع يحتاج تسجيل دخول أو Cookies. حدّد COOKIES_FILE في ملف .env.")
-    if "private video" in lowered:
-        return RuntimeError("هذا المقطع خاص ولا يمكن تحميله دون حساب مخوّل.")
+    logger.warning("yt-dlp error: %s", text[-1200:])
+
+    if _contains_any(lowered, ("http error 429", "status code 429", "too many requests")):
+        return RuntimeError("المنصة قيّدت عنوان IP الخاص بالخادم مؤقتًا (HTTP 429). انتظر أو استخدم خادمًا/عنوان IP آخر.")
+    if _contains_any(lowered, ("http error 403", "status code 403", "403 forbidden")):
+        return RuntimeError("رفضت المنصة الطلب من الخادم (HTTP 403). حدّث الحاوية أولًا، وقد يكون عنوان IP السحابي مقيّدًا.")
+    if _contains_any(lowered, ("private video", "this video is private", "private account")):
+        return RuntimeError("هذا المقطع أو الحساب خاص ولا يمكن الوصول إليه دون حساب مخوّل.")
+    if _contains_any(lowered, (
+        "sign in to confirm your age",
+        "age-restricted",
+        "age restricted",
+        "login required",
+        "authentication required",
+        "use --cookies",
+        "use --cookies-from-browser",
+        "cookies are required",
+        "this video is only available to registered users",
+        "members-only",
+    )):
+        return RuntimeError("هذا المحتوى نفسه يتطلب تسجيل دخول. أضف Cookies صالحة فقط لهذا النوع من المقاطع.")
+    if _contains_any(lowered, (
+        "javascript runtime",
+        "no supported javascript runtime",
+        "external javascript",
+        "challenge solver",
+        "signature solving failed",
+        "nsig extraction failed",
+        "requested format is not available",
+        "only images are available",
+    )):
+        return RuntimeError("تعذر حل حماية JavaScript أو استخراج صيغ الفيديو. أعد بناء الحاوية لتثبيت Deno وملحقات yt-dlp الحديثة.")
+    if _contains_any(lowered, ("unsupported url", "url could not be parsed")):
+        return RuntimeError("الرابط غير مدعوم أو غير مكتمل.")
+    if _contains_any(lowered, ("unable to download webpage", "failed to resolve", "name or service not known", "network is unreachable", "timed out", "timeout")):
+        return RuntimeError("تعذر اتصال الخادم بالمنصة. تحقق من DNS والاتصال الخارجي وسجلات الحاوية.")
     if "requested format is not available" in lowered:
         return RuntimeError("الصيغة المختارة لم تعد متاحة. أرسل الرابط مجددًا لتحديث قائمة الصيغ.")
-    if "unsupported url" in lowered:
-        return RuntimeError("الرابط غير مدعوم أو غير مكتمل.")
-    return RuntimeError(f"فشل yt-dlp: {text[-450:]}")
+    return RuntimeError(f"فشل yt-dlp: {text[-700:]}")
 
 
 def _inspect_sync(url: str, mode: str) -> MediaInfo:
